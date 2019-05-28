@@ -7,7 +7,7 @@
   "scripts": {
     "install": "node-gyp rebuild --release -j 4",
     "lint": "find src -name '*.cc' | xargs -n1 ./clang-tidy-wrapper",
-    "test": "node test.js || nodejs test.js"
+    "test": "cross-env NODE_ENV=development node test.js || cross-env NODE_ENV=development nodejs test.js"
   },
   "repository": {
     "type": "git",
@@ -19,5 +19,8 @@
   "bugs": {
     "url": "https://github.com/laverdet/isolated-vm/issues"
   },
-  "homepage": "https://github.com/laverdet/isolated-vm#readme"
+  "homepage": "https://github.com/laverdet/isolated-vm#readme",
+  "devDependencies": {
+    "cross-env": "^5.2.0"
+  }
 }

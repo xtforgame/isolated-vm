@@ -21,7 +21,9 @@ function runTest(test, cb) {
 	if (match) {
 		args = match[1].split(/ /g);
 	}
-	args.push(testPath);
+  args.push(testPath);
+  
+  console.log('env :', env);
 
 	// Launch process
 	let proc = spawn(process.execPath, args, { env });
