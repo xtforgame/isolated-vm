@@ -47,7 +47,6 @@ class ModuleHandle : public TransferableHandle {
 		v8::Local<v8::Value> GetDependencySpecifiers();
 		std::shared_ptr<ModuleInfo> GetInfo() const;
 
-		v8::Local<v8::Value> Instantiate(class ContextHandle* context_handle, v8::Local<v8::Function> callback);
 		v8::Local<v8::Value> InstantiateSync(class ContextHandle* context_handle, v8::Local<v8::Function> callback);
 
 		template <int async>

@@ -52,7 +52,6 @@ Local<FunctionTemplate> ModuleHandle::Definition() {
 	return Inherit<TransferableHandle>(MakeClass(
 		"Module", nullptr,
 		"dependencySpecifiers", ParameterizeAccessor<decltype(&ModuleHandle::GetDependencySpecifiers), &ModuleHandle::GetDependencySpecifiers>(),
-		"instantiate", Parameterize<decltype(&ModuleHandle::Instantiate), &ModuleHandle::Instantiate>(),
 		"instantiateSync", Parameterize<decltype(&ModuleHandle::InstantiateSync), &ModuleHandle::InstantiateSync>(),
 		"evaluate", Parameterize<decltype(&ModuleHandle::Evaluate<1>), &ModuleHandle::Evaluate<1>>(),
 		"evaluateSync", Parameterize<decltype(&ModuleHandle::Evaluate<0>), &ModuleHandle::Evaluate<0>>(),
@@ -81,25 +80,20 @@ std::shared_ptr<ModuleInfo> ModuleHandle::GetInfo() const {
 	return info;
 }
 
-/**
- * Implements the module linking logic used by `instantiate`. This is implemented as a class handle
- * so v8 can manage the lifetime of the linker. If a promise fails to resolve then v8 will be
- * responsible for calling the destructor.
- */
-class ModuleLinker : public ClassHandle {
+class ModuleLinker {
 	public:
 		/**
 		 * These methods are split out from the main class so I don't have to recreate the class
 		 * inheritance in v8
 		 */
 		struct Implementation {
-			RemoteHandle<Object> linker;
-			explicit Implementation(Local<Object> linker) : linker(linker) {}
+			ModuleLinker* linker;
+			explicit Implementation(ModuleLinker* linker) : linker(linker) {}
 			virtual ~Implementation() = default;
 			virtual void HandleCallbackReturn(ModuleHandle* module, size_t ii, Local<Value> value) = 0;
 			virtual Local<Value> Begin(ModuleHandle* module, shared_ptr<RemoteHandle<Context>> context) = 0;
 			ModuleLinker& GetLinker() {
-				auto ptr = ClassHandle::Unwrap<ModuleLinker>(linker.Deref());
+				auto ptr = linker;
 				assert(ptr);
 				return *ptr;
 			}
@@ -111,19 +105,15 @@ class ModuleLinker : public ClassHandle {
 		std::vector<std::shared_ptr<ModuleInfo>> modules;
 
 	public:
-		static v8::Local<v8::FunctionTemplate> Definition() {
-			return MakeClass("Linker", nullptr);
-		}
-
 		explicit ModuleLinker(Local<Function> callback) : callback(callback) {}
 
-		~ModuleLinker() override {
+		~ModuleLinker() {
 			Reset();
 		}
 
 		template <typename T>
 		void SetImplementation() {
-			impl = std::make_unique<T>(This());
+			impl = std::make_unique<T>(this);
 		}
 
 		template <typename T>
@@ -200,7 +190,7 @@ class ModuleLinker : public ClassHandle {
 struct InstantiateRunner : public ThreePhaseTask {
 	shared_ptr<RemoteHandle<Context>> context;
 	shared_ptr<ModuleInfo> info;
-	RemoteHandle<Object> linker;
+	ModuleLinker* linker;
 
 	static MaybeLocal<Module> ResolveCallback(Local<Context> /* context */, Local<String> specifier, Local<Module> referrer) {
 		MaybeLocal<Module> ret;
@@ -229,7 +219,7 @@ struct InstantiateRunner : public ThreePhaseTask {
 	InstantiateRunner(
 		shared_ptr<RemoteHandle<Context>> context,
 		shared_ptr<ModuleInfo> info,
-		Local<Object> linker
+		ModuleLinker* linker
 	) :
 		context(std::move(context)),
 		info(std::move(info)),
@@ -251,7 +241,7 @@ struct InstantiateRunner : public ThreePhaseTask {
 	}
 
 	Local<Value> Phase3() final {
-		ClassHandle::Unwrap<ModuleLinker>(linker.Deref())->Reset(ModuleInfo::LinkStatus::Linked);
+		linker->Reset(ModuleInfo::LinkStatus::Linked);
 		return Undefined(Isolate::GetCurrent());
 	}
 };
@@ -279,107 +269,15 @@ class ModuleLinkerSync : public ModuleLinker::Implementation {
 				throw;
 			}
 			auto info = module->GetInfo();
-			return ThreePhaseTask::Run<0, InstantiateRunner>(*info->handle.GetIsolateHolder(), context, info, linker.Deref());
+			return ThreePhaseTask::Run<0, InstantiateRunner>(*info->handle.GetIsolateHolder(), context, info, linker);
 		}
 };
-
-class ModuleLinkerAsync : public ModuleLinker::Implementation {
-	private:
-		RemoteTuple<Promise::Resolver, Function> async_handles;
-		shared_ptr<RemoteHandle<Context>> context;
-		shared_ptr<ModuleInfo> info;
-		bool rejected = false;
-		uint32_t pending = 0;
-
-		static Local<Value> ModuleResolved(Local<Array> holder, Local<Value> value) {
-			FunctorRunners::RunBarrier([&]() {
-				ModuleHandle* resolved = value->IsObject() ? ClassHandle::Unwrap<ModuleHandle>(value.As<Object>()) : nullptr;
-				if (resolved == nullptr) {
-					throw js_type_error("Resolved dependency was not `Module`");
-				}
-				Local<Context> context = Isolate::GetCurrent()->GetCurrentContext();
-				auto linker = ClassHandle::Unwrap<ModuleLinker>(Unmaybe(holder->Get(context, 0)).As<Object>());
-				auto& impl = linker->GetImplementation<ModuleLinkerAsync>();
-				if (impl.rejected) {
-					return;
-				}
-				auto module = ClassHandle::Unwrap<ModuleHandle>(Unmaybe(holder->Get(context, 1)).As<Object>());
-				auto ii = Unmaybe(holder->Get(context, 2)).As<Uint32>()->Value();
-				linker->ResolveDependency(ii, *module->GetInfo(), resolved);
-				if (--impl.pending == 0) {
-					impl.Instantiate();
-				}
-			});
-			return Undefined(Isolate::GetCurrent());
-		}
-
-		static Local<Value> ModuleRejected(ModuleLinker* linker, Local<Value> error) {
-			FunctorRunners::RunBarrier([&]() {
-				auto& impl = linker->GetImplementation<ModuleLinkerAsync>();
-				if (!impl.rejected) {
-					impl.rejected = true;
-					linker->Reset();
-					Unmaybe(impl.async_handles.Deref<0>()->Reject(Isolate::GetCurrent()->GetCurrentContext(), error));
-				}
-			});
-			return Undefined(Isolate::GetCurrent());
-		}
-
-		void HandleCallbackReturn(ModuleHandle* module, size_t ii, Local<Value> value) final {
-			// Resolve via Promise.resolve() so thenables will work
-			++pending;
-			Isolate* isolate = Isolate::GetCurrent();
-			Local<Context> context = isolate->GetCurrentContext();
-			Local<Promise::Resolver> resolver = Unmaybe(Promise::Resolver::New(context));
-			Local<Promise> promise = resolver->GetPromise();
-			Local<Array> holder = Array::New(isolate, 3);
-			Unmaybe(holder->Set(context, 0, linker.Deref()));
-			Unmaybe(holder->Set(context, 1, module->This()));
-			Unmaybe(holder->Set(context, 2, Uint32::New(isolate, ii)));
-			promise = Unmaybe(promise->Then(context, ClassHandle::ParameterizeCallback<decltype(&ModuleResolved), &ModuleResolved>(holder)));
-			Unmaybe(promise->Catch(context, async_handles.Deref<1>()));
-			Unmaybe(resolver->Resolve(context, value));
-		}
-
-		void Instantiate() {
-			Unmaybe(async_handles.Deref<0>()->Resolve(
-				Isolate::GetCurrent()->GetCurrentContext(),
-				ThreePhaseTask::Run<1, InstantiateRunner>(*info->handle.GetIsolateHolder(), context, info, linker.Deref())
-			));
-		}
-
-	public:
-		explicit ModuleLinkerAsync(Local<Object> linker) : Implementation(linker), async_handles(
-			Unmaybe(Promise::Resolver::New(Isolate::GetCurrent()->GetCurrentContext())),
-			ClassHandle::ParameterizeCallback<decltype(&ModuleRejected), &ModuleRejected>(linker)
-		) {}
-
-		using ModuleLinker::Implementation::Implementation;
-		Local<Value> Begin(ModuleHandle* module, shared_ptr<RemoteHandle<Context>> context) final {
-			GetLinker().Link(module);
-			info = module->GetInfo();
-			this->context = std::move(context);
-			if (pending == 0) {
-				Instantiate();
-			}
-			return async_handles.Deref<0>()->GetPromise();
-		}
-};
-
-Local<Value> ModuleHandle::Instantiate(ContextHandle* context_handle, Local<Function> callback) {
-	context_handle->CheckDisposed();
-	Local<Object> linker_handle = ClassHandle::NewInstance<ModuleLinker>(callback);
-	auto linker = ClassHandle::Unwrap<ModuleLinker>(linker_handle);
-	linker->SetImplementation<ModuleLinkerAsync>();
-	return linker->Begin(this, context_handle->context);
-}
 
 Local<Value> ModuleHandle::InstantiateSync(ContextHandle* context_handle, Local<Function> callback) {
 	context_handle->CheckDisposed();
-	Local<Object> linker_handle = ClassHandle::NewInstance<ModuleLinker>(callback);
-	auto linker = ClassHandle::Unwrap<ModuleLinker>(linker_handle);
-	linker->SetImplementation<ModuleLinkerSync>();
-	return linker->Begin(this, context_handle->context);
+	ModuleLinker linker(callback);
+	linker.SetImplementation<ModuleLinkerSync>();
+	return linker.Begin(this, context_handle->context);
 }
 
 struct EvaluateRunner : public ThreePhaseTask {
